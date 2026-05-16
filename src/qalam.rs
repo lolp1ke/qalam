@@ -15,14 +15,12 @@ use crate::{command::Command, event::Event, room::RoomId};
 
 #[derive(derive_more::Debug)]
 pub struct Qalam {
+  local_peer_id: PeerId,
   #[debug(skip)]
   swarm: Swarm<QalamBehaviour>,
 
   cmd_rx: mpsc::Receiver<Command>,
-
   event_tx: mpsc::Sender<Event>,
-
-  local_peer_id: PeerId,
 }
 impl Qalam {
   pub fn new(
@@ -30,7 +28,7 @@ impl Qalam {
     event_tx: mpsc::Sender<Event>,
     keypair: Keypair,
     listen_on: Multiaddr,
-    bootstrap_nodes: Vec<Multiaddr>,
+    bootstrap_nodes: Option<Vec<Multiaddr>>,
   ) -> Self {
     let local_peer_id = keypair.public().to_peer_id();
 
@@ -52,17 +50,19 @@ impl Qalam {
       .listen_on(listen_on)
       .expect("failed to start listening");
 
-    for addr in bootstrap_nodes.into_iter() {
-      if let Err(err) = swarm.dial(addr) {
-        tracing::warn!("failed to connect to a bootstrap node: {:?}", err);
-      };
-    }
+    if let Some(bootstrap_nodes) = bootstrap_nodes {
+      for addr in bootstrap_nodes.into_iter() {
+        if let Err(err) = swarm.dial(addr) {
+          tracing::warn!("failed to connect to a bootstrap node: {:?}", err);
+        };
+      }
+    };
 
     Self {
+      local_peer_id,
       swarm,
       cmd_rx,
       event_tx,
-      local_peer_id,
     }
   }
 
