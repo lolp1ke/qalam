@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use libp2p::PeerId;
+use libp2p::{PeerId, gossipsub::IdentTopic};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -23,7 +23,10 @@ impl RoomId {
     Self(hash.into())
   }
 
-  pub fn as_str(&self) -> String {
+  pub(crate) fn to_topic(self) -> IdentTopic {
+    IdentTopic::new(self.as_str())
+  }
+  fn as_str(&self) -> String {
     format!("room/{}", hex::encode(self.0))
   }
 }
@@ -31,12 +34,15 @@ impl RoomId {
 #[derive(Debug)]
 pub struct Room {
   pub id: RoomId,
+  pub members: Vec<PeerId>,
+  pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug)]
 pub struct ChatMessage {
   pub id: Uuid,
   pub room: RoomId,
-  pub content: Arc<str>,
+  pub from: PeerId,
+  pub content: Arc<[Arc<str>]>,
   pub ts: u64,
 }
