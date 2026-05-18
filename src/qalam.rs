@@ -1,11 +1,17 @@
-use std::{sync::Arc, time::Duration};
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+  collections::{BTreeMap, HashMap},
+  sync::Arc,
+  time::Duration,
+};
 
 use futures_util::StreamExt;
 use libp2p::{
   Multiaddr, PeerId, Swarm, SwarmBuilder,
-  gossipsub::{self, IdentTopic},
+  gossipsub::{self, TopicHash},
   identity::Keypair,
-  mdns, noise,
+  mdns, noise, request_response,
   swarm::{NetworkBehaviour, SwarmEvent},
   tcp, yamux,
 };
@@ -13,24 +19,32 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-  command::Command,
-  event::Event,
+  command::QalamCommand,
+  direct::{
+    QalamDirect, QalamDirectProtocol, QalamDirectRequest, QalamDirectResponse,
+  },
+  event::QalamEvent,
   room::{ChatMessage, RoomId},
+  time::QalamTime,
 };
 
 #[derive(derive_more::Debug)]
 pub struct Qalam {
+  persona: Arc<str>,
   local_peer_id: PeerId,
   #[debug(skip)]
   swarm: Swarm<QalamBehaviour>,
 
-  cmd_rx: mpsc::UnboundedReceiver<Command>,
-  event_tx: mpsc::Sender<Event>,
+  cmd_rx: mpsc::UnboundedReceiver<QalamCommand>,
+  event_tx: mpsc::Sender<QalamEvent>,
+
+  room_id_by_topic: BTreeMap<TopicHash, RoomId>,
 }
 impl Qalam {
   pub fn new(
-    cmd_rx: mpsc::UnboundedReceiver<Command>,
-    event_tx: mpsc::Sender<Event>,
+    persona: Arc<str>,
+    cmd_rx: mpsc::UnboundedReceiver<QalamCommand>,
+    event_tx: mpsc::Sender<QalamEvent>,
     keypair: Keypair,
     listen_on: Multiaddr,
     bootstrap_nodes: Option<Vec<Multiaddr>>,
@@ -64,10 +78,12 @@ impl Qalam {
     };
 
     Self {
+      persona,
       local_peer_id,
       swarm,
       cmd_rx,
       event_tx,
+      room_id_by_topic: BTreeMap::default(),
     }
   }
 
@@ -82,7 +98,9 @@ impl Qalam {
           self.handle_swarm_event(event).await;
         }
         Some(cmd) = self.cmd_rx.recv() => {
-          self.handle_command(cmd).await;
+          if !self.handle_command(cmd).await {
+            break;
+          };
         }
       }
     }
@@ -93,9 +111,23 @@ impl Qalam {
     event: SwarmEvent<QalamBehaviourEvent>,
   ) {
     match event {
-      SwarmEvent::Behaviour(QalamBehaviourEvent::Mdns(
-        mdns::Event::Discovered(peers),
-      )) => {
+      SwarmEvent::Behaviour(event) => {
+        if let Err(err) = self.handle_behaviour(event).await {
+          tracing::warn!("behaviour error: {:?}", err);
+        };
+      }
+
+      event => {
+        tracing::trace!("swarm event: {:?}", event);
+      }
+    };
+  }
+  async fn handle_behaviour(
+    &mut self,
+    event: QalamBehaviourEvent,
+  ) -> anyhow::Result<()> {
+    match event {
+      QalamBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) => {
         for (peer_id, addr) in peers.into_iter() {
           tracing::info!("discovered {}:{}", peer_id, addr);
           self
@@ -107,9 +139,7 @@ impl Qalam {
           self.swarm.add_external_address(addr);
         }
       }
-      SwarmEvent::Behaviour(QalamBehaviourEvent::Mdns(
-        mdns::Event::Expired(peers),
-      )) => {
+      QalamBehaviourEvent::Mdns(mdns::Event::Expired(peers)) => {
         for (peer_id, addr) in peers.into_iter() {
           tracing::info!("expired {}:{}", peer_id, addr);
           self
@@ -119,73 +149,137 @@ impl Qalam {
             .remove_explicit_peer(&peer_id);
           self.swarm.remove_external_address(&addr);
           if self.swarm.disconnect_peer_id(peer_id).is_err() {
-            tracing::warn!("failed to disconnect: {}", peer_id);
+            tracing::warn!("failed to disconnect from peer");
           };
         }
       }
-      SwarmEvent::Behaviour(QalamBehaviourEvent::Gossipsub(
-        gossipsub::Event::Message {
-          propagation_source,
-          message_id,
-          message,
-        },
-      )) => {
-        let Ok(content) = String::from_utf8(message.data) else {
-          return;
+
+      QalamBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        propagation_source,
+        message,
+        ..
+      }) => {
+        let content = String::from_utf8(message.data)?;
+        if let Some(&room) = self.room_id_by_topic.get(&message.topic) {
+          self
+            .event_tx
+            .send(QalamEvent::ChatMessageReceieved {
+              room,
+              message: ChatMessage {
+                id: Uuid::now_v7(),
+                from: propagation_source,
+                content: content.lines().map(Arc::from).collect(),
+                ts: QalamTime::now(),
+              },
+            })
+            .await?;
         };
-        if let Err(err) = self
-          .event_tx
-          .send(Event::ChatMessageReceieved(ChatMessage {
-            id: Uuid::now_v7(),
-            room: RoomId::room("global"),
-            from: propagation_source,
-            content: content.lines().map(Arc::from).collect(),
-            ts: 0,
-          }))
-          .await
-        {
-          tracing::warn!("failed to send event: {:?}\n{:?}", err.0, err);
-        };
-        // tracing::info!("got {:?}", message);
       }
-      SwarmEvent::Behaviour(QalamBehaviourEvent::Gossipsub(
-        gossipsub::Event::Subscribed { peer_id, topic },
-      )) => {
+      QalamBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+        peer_id,
+        topic,
+      }) => {
         tracing::info!("peer {:?} subscribed to: {:?}", peer_id, topic);
+      }
+      QalamBehaviourEvent::Direct(request_response::Event::Message {
+        message:
+          request_response::Message::Request {
+            request, channel, ..
+          },
+        ..
+      }) => {
+        let response = self.handle_direct_request(request.clone()).await;
+        self
+          .swarm
+          .behaviour_mut()
+          .direct
+          .send_response(channel, response)?;
+      }
+      QalamBehaviourEvent::Direct(request_response::Event::Message {
+        message: request_response::Message::Response { response, .. },
+        ..
+      }) => {
+        self.handle_direct_response(response).await?;
       }
 
       _ => {}
     };
+
+    Ok(())
   }
-  async fn handle_command(&mut self, cmd: Command) {
+  async fn handle_direct_request(
+    &mut self,
+    request: QalamDirectRequest,
+  ) -> QalamDirectResponse {
+    match request {
+      QalamDirectRequest::Ping => QalamDirectResponse::Pong,
+      QalamDirectRequest::Persona => QalamDirectResponse::Persona {
+        peer: self.local_peer_id,
+        ident: self.persona.clone(),
+      },
+    }
+  }
+  async fn handle_direct_response(
+    &mut self,
+    response: QalamDirectResponse,
+  ) -> anyhow::Result<()> {
+    match response {
+      QalamDirectResponse::Pong => {
+        tracing::info!("pong");
+      }
+      QalamDirectResponse::Persona {
+        peer,
+        ident: persona,
+      } => {
+        tracing::debug!("fires");
+        self
+          .event_tx
+          .send(QalamEvent::PersonaReceived { peer, persona })
+          .await?;
+      }
+    };
+    Ok(())
+  }
+  async fn handle_command(&mut self, cmd: QalamCommand) -> bool {
     match cmd {
-      Command::JoinRoom { name } => {
+      QalamCommand::Shutdown => {
+        return false;
+      }
+      QalamCommand::JoinRoom { name } => {
         let room = RoomId::room(&name);
         let topic = room.to_topic();
 
         if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic)
         {
           tracing::warn!("failed to subscribe to: {}\n{:?}", topic, err);
-          return;
+          return true;
         };
         tracing::info!("subscribed to: {:?}", topic);
+        self.room_id_by_topic.insert(topic.hash(), room);
 
-        if let Err(err) = self.event_tx.send(Event::RoomJoined { room }).await {
+        if let Err(err) =
+          self.event_tx.send(QalamEvent::RoomJoined { room }).await
+        {
           tracing::warn!("failed to send event: {:?}\n{:?}", err.0, err)
         };
       }
-      Command::LeaveRoom { room } => {
+      QalamCommand::LeaveRoom { room } => {
         let topic = room.to_topic();
         if !self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
           tracing::warn!("failed to unsubscribe from topic: {}", topic);
-          return;
+          return true;
         };
-        if let Err(err) = self.event_tx.send(Event::RoomLeft { room }).await {
+        if self.room_id_by_topic.remove(&topic.hash()).is_none() {
+          tracing::warn!("double remove of room in [`room_id_by_name`]");
+        };
+        if let Err(err) =
+          self.event_tx.send(QalamEvent::RoomLeft { room }).await
+        {
           tracing::warn!("failed to send event: {:?}\n{:?}", err.0, err);
         };
       }
 
-      Command::SendRoomMessage {
+      QalamCommand::SendRoomMessage {
         room,
         from,
         message,
@@ -201,19 +295,30 @@ impl Qalam {
         };
         if let Err(err) = self
           .event_tx
-          .send(Event::ChatMessageReceieved(ChatMessage {
-            id: Uuid::now_v7(),
+          .send(QalamEvent::ChatMessageReceieved {
             room,
-            from,
-            content: message,
-            ts: 0,
-          }))
+            message: ChatMessage {
+              id: Uuid::now_v7(),
+              from,
+              content: message,
+              ts: QalamTime::now(),
+            },
+          })
           .await
         {
           tracing::warn!("failed to send event: {:?}\n{:?}", err.0, err);
         };
       }
+
+      QalamCommand::RequestPersona { peer } => {
+        self
+          .swarm
+          .behaviour_mut()
+          .direct
+          .send_request(&peer, QalamDirectRequest::Persona);
+      }
     };
+    true
   }
 }
 
@@ -223,6 +328,8 @@ pub struct QalamBehaviour {
   gossipsub: gossipsub::Behaviour,
   #[debug(skip)]
   mdns: mdns::tokio::Behaviour,
+  #[debug(skip)]
+  direct: request_response::Behaviour<QalamDirect>,
 }
 impl QalamBehaviour {
   pub fn new(local_peer_id: PeerId, keypair: Keypair) -> Self {
@@ -243,6 +350,13 @@ impl QalamBehaviour {
     let mdns = mdns::Behaviour::new(mdns_config, local_peer_id)
       .expect("mdns build failed");
 
-    Self { gossipsub, mdns }
+    Self {
+      gossipsub,
+      mdns,
+      direct: request_response::Behaviour::new(
+        [(QalamDirectProtocol, request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+      ),
+    }
   }
 }

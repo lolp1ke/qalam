@@ -1,11 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::Arc;
 
 use libp2p::{PeerId, gossipsub::IdentTopic};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::time::QalamTime;
+
 #[derive(Debug)]
 #[derive(Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct RoomId(pub [u8; 32]);
 impl RoomId {
   pub fn room(name: &str) -> Self {
@@ -26,7 +31,7 @@ impl RoomId {
   pub(crate) fn to_topic(self) -> IdentTopic {
     IdentTopic::new(self.as_str())
   }
-  fn as_str(&self) -> String {
+  pub fn as_str(&self) -> String {
     format!("room/{}", hex::encode(self.0))
   }
 }
@@ -41,8 +46,7 @@ pub struct Room {
 #[derive(Debug)]
 pub struct ChatMessage {
   pub id: Uuid,
-  pub room: RoomId,
   pub from: PeerId,
   pub content: Arc<[Arc<str>]>,
-  pub ts: u64,
+  pub ts: QalamTime,
 }
