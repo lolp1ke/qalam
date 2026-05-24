@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-  fmt::{Display, Write},
-  io,
-  str::FromStr,
-  sync::Arc,
-};
+use std::{fmt::Display, io, str::FromStr, sync::Arc};
 
 use ciborium::cbor;
 use futures_util::{
@@ -287,17 +282,17 @@ fn cbor_get_value<'a>(
   match value {
     ciborium::Value::Map(m) => m
       .iter()
-      .find(|(k, _)| k == &ciborium::Value::Text(key.into()))
+      .find(|(k, _)| *k == ciborium::Value::Text(key.into()))
       .map(|(_, v)| v)
       .ok_or_else(|| {
         io::Error::new(
           io::ErrorKind::InvalidData,
-          format!("missing field: '{key}'"),
+          format!("missing field: '{}'", key),
         )
       }),
     _ => Err(io::Error::new(
       io::ErrorKind::InvalidData,
-      format!("expected map at '{key}'"),
+      format!("expected map at '{}'", key),
     )),
   }
 }
